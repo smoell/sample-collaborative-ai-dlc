@@ -1,5 +1,14 @@
 data "aws_availability_zones" "available" {
   state = "available"
+
+  # Only standard AZs. Without this filter, the list can include Local Zones
+  # or Wavelength Zones (if the account has opted in), which land in
+  # names[0]/names[1] and break NAT Gateway, Neptune subnet groups, and ELB
+  # ("subnets from multiple locales"). opt-in-not-required == regular AZs only.
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
 }
 
 # VPC

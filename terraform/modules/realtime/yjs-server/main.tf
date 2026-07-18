@@ -72,32 +72,9 @@ resource "aws_ecr_lifecycle_policy" "yjs_server" {
   })
 }
 
-# Docker build module
-module "yjs_docker_build" {
-  source  = "terraform-aws-modules/lambda/aws//modules/docker-build"
-  version = "~> 7.0"
-
-  create_ecr_repo = false
-  ecr_repo        = aws_ecr_repository.yjs_server.name
-  ecr_address     = format("%v.dkr.ecr.%v.%v", data.aws_caller_identity.current.account_id, data.aws_region.current.id, local.dns_suffix)
-
-  use_image_tag = true
-  # substr(var.build_after, 0, 0) is always "" — it exists only to create a
-  # plan-graph dependency on the agents image build, so the two docker builds
-  # never run concurrently (parallel kreuzwerker provider builds deadlock).
-  # It can never change the tag or trigger a rebuild.
-  image_tag        = "${local.yjs_image_tag}${substr(var.build_after, 0, 0)}"
-  source_path      = local.yjs_source_path
-  docker_file_path = "${local.yjs_source_path}/Dockerfile"
-  platform         = "linux/amd64"
-  # BuildKit session path instead of the provider's legacy tar.gz streaming —
-  # see the agents module for rationale.
-  builder = "default"
-
-  triggers = {
-    dir_sha = local.yjs_files_sha
-  }
-}
+# yjs-server image is built by AWS CodeBuild (see codebuild.tf) and pushed to
+# ECR. var.build_after is retained (unused) so the root module call is
+# unchanged; build serialization is no longer needed with CodeBuild.
 
 # ECS Cluster
 resource "aws_ecs_cluster" "main" {
@@ -188,7 +165,7 @@ resource "aws_ecs_task_definition" "yjs_server" {
 
   container_definitions = jsonencode([{
     name      = "yjs-server"
-    image     = module.yjs_docker_build.image_uri
+    image     = local.yjs_image_uri
     essential = true
     portMappings = [{
       containerPort = 1234
@@ -225,6 +202,9 @@ resource "aws_ecs_task_definition" "yjs_server" {
       }
     }
   }])
+
+  # Ensure the image exists in ECR (CodeBuild finished) before the task def.
+  depends_on = [null_resource.yjs_build]
 }
 
 # CloudWatch Log Group

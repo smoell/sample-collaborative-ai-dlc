@@ -72,35 +72,11 @@ locals {
   dns_suffix = data.aws_partition.current.dns_suffix
 }
 
-# Docker build module
-module "agents_docker_build" {
-  source  = "terraform-aws-modules/lambda/aws//modules/docker-build"
-  version = "~> 7.0"
-
-  create_ecr_repo = false
-  ecr_repo        = aws_ecr_repository.agents.name
-  ecr_address     = format("%v.dkr.ecr.%v.%v", data.aws_caller_identity.current.account_id, data.aws_region.current.id, local.dns_suffix)
-
-  use_image_tag    = true
-  image_tag        = local.agents_image_tag
-  source_path      = local.agents_source_path
-  docker_file_path = "${local.agents_source_path}/agents-ecs/Dockerfile"
-  platform         = "linux/amd64"
-  # Use the buildx "default" builder (BuildKit session) instead of the
-  # provider's legacy /build path. The legacy path streams the whole context
-  # as a single tar.gz and corrupts it on large contexts (unpigz: invalid
-  # deflate data); the BuildKit session transfers files incrementally and
-  # applies .dockerignore client-side. "default" exists on every Docker
-  # Desktop and docker-engine install.
-  builder = "default"
-
-  build_args = {
-    IMAGE_TAG = local.agents_image_tag
-  }
-
-  triggers = {
-    dir_sha = local.agents_files_sha
-  }
+# Agent image is built by AWS CodeBuild (see codebuild.tf) and pushed to ECR
+# as "<repository_url>:<agents_image_tag>". The local docker-build module was
+# removed to avoid fragile local Apple-Silicon builds (QEMU / disk pressure).
+locals {
+  agent_image_uri = "${aws_ecr_repository.agents.repository_url}:${local.agents_image_tag}"
 }
 
 # ---------------------------------------------------------------------------
@@ -342,7 +318,7 @@ resource "aws_ecs_task_definition" "agent" {
 
   container_definitions = jsonencode([{
     name        = "agent"
-    image       = module.agents_docker_build.image_uri
+    image       = local.agent_image_uri
     essential   = true
     stopTimeout = 120
     healthCheck = {
@@ -392,4 +368,7 @@ resource "aws_ecs_task_definition" "agent" {
   }])
 
   tags = var.tags
+
+  # Ensure the image exists in ECR (CodeBuild finished) before the task def is created.
+  depends_on = [null_resource.agents_build]
 }

@@ -56,3 +56,13 @@ variable "build_after" {
   type        = string
   default     = ""
 }
+
+variable "artifacts_bucket_name" {
+  description = "S3 bucket used to stage the CodeBuild source archive"
+  type        = string
+}
+
+variable "artifacts_bucket_arn" {
+  description = "ARN of the S3 bucket used to stage the CodeBuild source archive"
+  type        = string
+}

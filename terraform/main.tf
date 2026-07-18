@@ -9,6 +9,10 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
   backend "s3" {}
 }
@@ -301,6 +305,8 @@ module "yjs_server" {
   cognito_user_pool_id          = module.auth.user_pool_id
   cognito_client_id             = module.auth.user_pool_client_id
   realtime_doc_secret_param_arn = module.realtime.realtime_doc_secret_param_arn
+  artifacts_bucket_name         = module.s3.artifacts_bucket_name
+  artifacts_bucket_arn          = module.s3.artifacts_bucket_arn
   # Serialize the yjs image build after the agents image build — concurrent
   # builds from the two docker provider instances deadlock at context
   # transfer. Value-neutral: only creates a dependency edge (see variable).
@@ -379,6 +385,8 @@ module "agents" {
 
   # Bedrock model pinning for claude and opencode drivers.
   bedrock_model = var.bedrock_model
+  # Small/fast model must also be an eu.* profile in eu-central-1 (default is us.*).
+  bedrock_small_fast_model = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 
   # Git identity for agent-created commits (overridable per deployment).
   git_author_name  = var.git_author_name

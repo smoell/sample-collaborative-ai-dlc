@@ -43,7 +43,7 @@ output "ecr_repository_arn" {
 
 output "agent_image_uri" {
   description = "Full image URI with tag for the deployed agent image"
-  value       = module.agents_docker_build.image_uri
+  value       = local.agent_image_uri
 }
 
 output "agent_image_tag" {

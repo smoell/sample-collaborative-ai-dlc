@@ -56,3 +56,6 @@ test/e2e/artifacts/
 
 # Terraform plan files (any environment suffix)
 tfplan*
+
+.neocode/
+**/.build/
