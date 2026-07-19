@@ -21,7 +21,7 @@ const gremlin = require('gremlin');
 const { fromNodeProviderChain } = require('@aws-sdk/credential-providers');
 const { getUrlAndHeaders } = require('gremlin-aws-sigv4/lib/utils');
 const { buildResponse } = require('./shared/response');
-const { resolveGitToken, ensureFreshGitToken } = require('./shared/git-token');
+const { ensureFreshGitToken } = require('./shared/git-token');
 const { getGitConnection } = require('./shared/git-connection-store');
 const { validateMcpServersJson } = require('./shared/mcp-validator');
 const { broadcastToSprintChannel } = require('./shared/ws-fanout');
@@ -871,7 +871,13 @@ exports.handler = async (event) => {
           // token passed in the re-trigger body).
           const Item = await getGitConnection(ddb, gitIdentityUserId, gitProvider);
           if (Item?.parameterName) {
-            gitToken = await resolveGitToken(ssm, Item);
+            // Use ensureFreshGitToken (not resolveGitToken): GitLab and Bitbucket
+            // access tokens expire (~2h). A sprint started >2h after the OAuth
+            // connect would otherwise dispatch a stale token, and the very first
+            // step — cloning the repo into /workspace — fails auth. The worker
+            // then mistakes the auth failure for an empty repo and runs against an
+            // empty workspace. Refresh at dispatch so the clone authenticates.
+            gitToken = await ensureFreshGitToken({ ssm, secrets, ddb, item: Item, gitProvider });
           }
         } catch (e) {
           console.error('Failed to fetch git token:', e.message);
@@ -885,7 +891,14 @@ exports.handler = async (event) => {
 
       // Require a matching provider connection for projects with a git repo
       if (gitRepo && !gitToken) {
-        const providerLabel = gitProvider === 'gitlab' ? 'GitLab' : 'GitHub';
+        // Human-readable provider name. Falls back to GitHub only for a truly
+        // unknown/empty provider — Bitbucket must not be mislabelled as GitHub.
+        const providerLabel =
+          gitProvider === 'gitlab'
+            ? 'GitLab'
+            : gitProvider === 'bitbucket'
+              ? 'Bitbucket'
+              : 'GitHub';
         return response(400, {
           error: `${providerLabel} not connected`,
           message: `You must connect your ${providerLabel} account before running agents on this project. Go to project settings to connect ${providerLabel}.`,

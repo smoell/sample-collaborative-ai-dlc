@@ -19,9 +19,15 @@ const id = 'gitlab';
 const displayName = 'GitLab';
 const gitHost = 'gitlab.com';
 
+// Username used in the clone URL's basic-auth userinfo. The construction runtime
+// (pool-worker) builds a TOKENLESS `https://<cloneAuthUser>@host/repo.git` URL and
+// supplies the token out-of-band via GIT_ASKPASS, so the secret never lands in
+// .git/config, process argv, or git's URL-bearing error output.
+const cloneAuthUser = 'oauth2';
+
 // GitLab clone URLs authenticate with the oauth2:<token> scheme.
 const buildCloneUrl = (repoId, token) => {
-  const auth = token ? `oauth2:${token}@` : '';
+  const auth = token ? `${cloneAuthUser}:${token}@` : '';
   return `https://${auth}${gitHost}/${repoId}.git`;
 };
 
@@ -588,6 +594,7 @@ module.exports = {
   gitHost,
   apiBase: API_BASE,
   buildCloneUrl,
+  cloneAuthUser,
   encodeProject,
   apiHeaders,
   glFetch,

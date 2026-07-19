@@ -57,6 +57,17 @@ const gitHost = (providerId) => getProvider(providerId).gitHost;
 const buildCloneUrl = (providerId, repoId, token) =>
   getProvider(providerId).buildCloneUrl(repoId, token);
 
+// Build a TOKENLESS clone URL that still carries the provider's basic-auth
+// username, e.g. https://x-token-auth@bitbucket.org/ws/repo.git. The password
+// (access token) is supplied out-of-band via GIT_ASKPASS so it is never written
+// into .git/config, exposed in process argv, or echoed in git's URL-bearing
+// error output (which the pool-worker streams to CloudWatch). Prefer this over
+// buildCloneUrl for anything that persists or logs the remote.
+const buildAuthCloneUrl = (providerId, repoId) => {
+  const provider = getProvider(providerId);
+  return `https://${provider.cloneAuthUser}@${provider.gitHost}/${repoId}.git`;
+};
+
 module.exports = {
   ProviderError,
   KNOWN_PROVIDERS: Object.keys(REGISTRY),
@@ -66,4 +77,5 @@ module.exports = {
   getProvider,
   gitHost,
   buildCloneUrl,
+  buildAuthCloneUrl,
 };

@@ -40,8 +40,41 @@ const { fromNodeProviderChain } = require('@aws-sdk/credential-providers');
 const { getUrlAndHeaders } = require('gremlin-aws-sigv4/lib/utils');
 const { cleanupMergedTaskBranch } = require('./branch-cleanup');
 const { buildConstructionOrchestratorPrompt } = require('./construction-orchestrator-prompt');
-const { buildCloneUrl } = require('../shared/git-providers');
+const { buildAuthCloneUrl } = require('../shared/git-providers');
 const { refreshGitToken } = require('../shared/git-token-refresh');
+
+// ---------------------------------------------------------------------------
+// Git credential handling
+// ---------------------------------------------------------------------------
+// The git access token is supplied to git via GIT_ASKPASS rather than being
+// embedded in the clone URL. This keeps the secret out of .git/config, process
+// argv (visible via /proc), and git's URL-bearing error messages — all of which
+// the worker streams to CloudWatch with stdio:'inherit'. Remote URLs are built
+// tokenless-with-username (https://x-token-auth@host/repo.git) so git only needs
+// the password, which the askpass helper prints from $GIT_TOKEN on demand.
+const GIT_ASKPASS_PATH = '/tmp/aidlc-git-askpass.sh';
+let askpassReady = false;
+function ensureGitAskpass() {
+  if (!askpassReady) {
+    // Prints the token as the git password. `GIT_TOKEN` is passed per-command in
+    // the child env (never persisted); the username comes from the remote URL.
+    fs.writeFileSync(GIT_ASKPASS_PATH, '#!/bin/sh\nprintf "%s" "$GIT_TOKEN"\n');
+    fs.chmodSync(GIT_ASKPASS_PATH, 0o700);
+    askpassReady = true;
+  }
+  return GIT_ASKPASS_PATH;
+}
+// Env for git commands that hit the network. When a token is present it wires
+// GIT_ASKPASS + GIT_TOKEN; GIT_TERMINAL_PROMPT=0 makes auth failures error out
+// instead of hanging on an interactive prompt in the non-TTY container.
+function gitAuthEnv(job) {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  if (job.gitToken) {
+    env.GIT_TOKEN = job.gitToken;
+    env.GIT_ASKPASS = ensureGitAskpass();
+  }
+  return env;
+}
 
 // ---------------------------------------------------------------------------
 // Driver — pluggable agent CLI abstraction
@@ -486,15 +519,32 @@ async function setupWorkspace(job) {
  */
 function cloneAndSetupBranch(job, repoUrl, targetDir) {
   try {
-    const cloneUrl = buildCloneUrl(job.gitProvider, repoUrl, job.gitToken);
+    // Tokenless remote URL (username only); the token is supplied via GIT_ASKPASS.
+    const cloneUrl = buildAuthCloneUrl(job.gitProvider, repoUrl);
+    const authEnv = gitAuthEnv(job);
 
-    // Try to clone - may fail if repo is empty
+    // Try to clone. A genuinely EMPTY repo clones successfully (git only prints
+    // a "warning: You appear to have cloned an empty repository" to stderr and
+    // exits 0), so a non-zero exit here is NOT an empty repo — it's a real
+    // failure (bad/expired credentials, network, wrong URL). We must NOT treat
+    // an auth failure as "empty" and silently run the agent against an empty
+    // workspace; that produces a valid-looking run on no code. Capture stderr
+    // and fail hard on authentication errors.
     try {
       execSync(`git clone "${cloneUrl}" "${targetDir}"`, {
-        stdio: 'inherit',
+        stdio: ['inherit', 'inherit', 'pipe'],
+        env: authEnv,
       });
-    } catch {
-      // If clone fails (empty repo), initialize new repo
+    } catch (cloneErr) {
+      const stderr = (cloneErr.stderr ? cloneErr.stderr.toString() : '') + (cloneErr.message || '');
+      if (/Authentication failed|could not read Username|403|401|fatal: unable to access/i.test(stderr)) {
+        // Credentials problem — do NOT fall through to "empty repo" init, which
+        // would run the agent against an empty workspace and produce a bogus run.
+        throw new Error(
+          `[pool-worker] git clone authentication failed for ${repoUrl}. The git token is likely expired or invalid — aborting instead of running against an empty workspace. Reconnect the git provider and retry.`,
+        );
+      }
+      // Genuine empty repo (or first commit not yet pushed): initialize a new repo.
       console.log(`[pool-worker] Clone failed for ${repoUrl} (likely empty repo), initializing...`);
       execSync(`mkdir -p "${targetDir}" && git init "${targetDir}"`, { stdio: 'inherit' });
       execSync(`cd "${targetDir}" && git remote add origin "${cloneUrl}"`, { stdio: 'inherit' });
@@ -536,6 +586,7 @@ function cloneAndSetupBranch(job, repoUrl, targetDir) {
           try {
             execSync(`cd "${targetDir}" && git push -u origin ${defaultBranch}`, {
               stdio: 'inherit',
+              env: authEnv,
             });
           } catch (pushErr) {
             console.error(
@@ -550,7 +601,7 @@ function cloneAndSetupBranch(job, repoUrl, targetDir) {
         const desiredBase = job.baseBranch || 'main';
         const baseExistsOnRemote = execSync(
           `cd "${targetDir}" && git ls-remote --heads origin ${desiredBase}`,
-          { encoding: 'utf8' },
+          { encoding: 'utf8', env: authEnv },
         ).trim();
         const effectiveBase = baseExistsOnRemote ? desiredBase : 'main';
         if (!baseExistsOnRemote && desiredBase !== 'main') {
@@ -562,19 +613,25 @@ function cloneAndSetupBranch(job, repoUrl, targetDir) {
         // Now create/checkout working branch
         const branchExists = execSync(
           `cd "${targetDir}" && git ls-remote --heads origin ${job.branch}`,
-          { encoding: 'utf8' },
+          { encoding: 'utf8', env: authEnv },
         ).trim();
 
         if (branchExists) {
           // Branch exists on remote — fetch and check it out
-          execSync(`cd "${targetDir}" && git fetch origin ${job.branch}`, { stdio: 'inherit' });
+          execSync(`cd "${targetDir}" && git fetch origin ${job.branch}`, {
+            stdio: 'inherit',
+            env: authEnv,
+          });
           execSync(`cd "${targetDir}" && git checkout ${job.branch}`, { stdio: 'inherit' });
         } else {
           // Branch does not exist on remote — create it from the effective base
           console.log(
             `[pool-worker] Creating new branch ${job.branch} from origin/${effectiveBase} in ${repoUrl}`,
           );
-          execSync(`cd "${targetDir}" && git fetch origin ${effectiveBase}`, { stdio: 'inherit' });
+          execSync(`cd "${targetDir}" && git fetch origin ${effectiveBase}`, {
+            stdio: 'inherit',
+            env: authEnv,
+          });
           execSync(`cd "${targetDir}" && git checkout -b ${job.branch} origin/${effectiveBase}`, {
             stdio: 'inherit',
           });
@@ -1218,12 +1275,14 @@ function pushBranchWithRetry(job, branch, maxRetries = 3, workDir = '/workspace'
     return false;
   }
 
-  // Re-inject token into remote URL for push authentication.
+  // Ensure the remote is the tokenless authenticated-user URL; the token itself
+  // is provided to git via GIT_ASKPASS (gitAuthEnv), never written into the URL.
   const repoUrl = getRepoUrlForDir(job, workDir);
+  const authEnv = gitAuthEnv(job);
   if (job.gitToken && repoUrl) {
     try {
       execSync(
-        `cd "${workDir}" && git remote set-url origin "${buildCloneUrl(job.gitProvider, repoUrl, job.gitToken)}"`,
+        `cd "${workDir}" && git remote set-url origin "${buildAuthCloneUrl(job.gitProvider, repoUrl)}"`,
         { stdio: 'inherit' },
       );
     } catch (urlErr) {
@@ -1285,6 +1344,7 @@ function pushBranchWithRetry(job, branch, maxRetries = 3, workDir = '/workspace'
       // name doesn't match (e.g. agent is on 'main' but we need to push to the task branch).
       execSync(`cd "${workDir}" && git push origin HEAD:refs/heads/${branch}`, {
         stdio: 'inherit',
+        env: authEnv,
       });
       console.log(`[pool-worker] Push succeeded for ${branch} (attempt ${attempt})`);
 
@@ -1292,6 +1352,7 @@ function pushBranchWithRetry(job, branch, maxRetries = 3, workDir = '/workspace'
       try {
         const remoteHead = execSync(`cd "${workDir}" && git ls-remote origin ${branch}`, {
           encoding: 'utf8',
+          env: authEnv,
         })
           .trim()
           .split(/\s/)[0];
@@ -1410,6 +1471,12 @@ function runAcpSession(job) {
       TASK_ID: job.taskId || '',
       BRANCH: job.branch || '',
       GIT_TOKEN: job.gitToken || '',
+      // The agent's own git commands authenticate against the tokenless remote
+      // URLs via this askpass helper (it prints $GIT_TOKEN as the password), so
+      // the token stays out of .git/config and argv here too. Only wired when a
+      // token is present (discussion-assist jobs have none).
+      GIT_ASKPASS: job.gitToken ? ensureGitAskpass() : '',
+      GIT_TERMINAL_PROMPT: '0',
       GIT_REPO: job.gitRepo || '',
       GIT_PROVIDER: job.gitProvider || 'github',
       GIT_USER_ID: job.userId || '',

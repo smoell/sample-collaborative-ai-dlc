@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   getProvider,
   buildCloneUrl,
+  buildAuthCloneUrl,
   gitHost,
   normalizeProviderId,
   isKnownProvider,
@@ -269,5 +270,103 @@ describe('OAuth metadata', () => {
     expect(capturedBody.grant_type).toBe('refresh_token');
     expect(capturedBody.redirect_uri).toBe('https://app.example.com/gitlab/callback');
     expect(out.accessToken).toBe('new-at');
+  });
+});
+
+describe('buildAuthCloneUrl — tokenless clone URLs with provider auth user', () => {
+  it('builds a tokenless URL carrying the provider basic-auth username', () => {
+    expect(buildAuthCloneUrl('github', 'owner/repo')).toBe(
+      'https://x-access-token@github.com/owner/repo.git',
+    );
+    expect(buildAuthCloneUrl('gitlab', 'group/project')).toBe(
+      'https://oauth2@gitlab.com/group/project.git',
+    );
+    expect(buildAuthCloneUrl('bitbucket', 'ws/repo')).toBe(
+      'https://x-token-auth@bitbucket.org/ws/repo.git',
+    );
+  });
+
+  it('never embeds a token (no colon-delimited password in the userinfo)', () => {
+    const url = buildAuthCloneUrl('bitbucket', 'ws/repo');
+    // userinfo must be "<user>@" only -- no "<user>:<secret>@"
+    expect(url).not.toMatch(/\/\/[^/@]*:[^/@]*@/);
+  });
+});
+
+describe('bitbucket - splitWorkspaceRepo validation', () => {
+  const bb = getProvider('bitbucket');
+
+  it('accepts a well-formed workspace/repo_slug', () => {
+    expect(bb.splitWorkspaceRepo('my-ws/my_repo.1')).toEqual({
+      workspace: 'my-ws',
+      repo_slug: 'my_repo.1',
+    });
+  });
+
+  it('rejects a missing or non-two-part reference', () => {
+    expect(() => bb.splitWorkspaceRepo('')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo('only-one')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo('a/b/c')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo(null)).toThrow(ProviderError);
+  });
+
+  it('rejects segments with characters outside [A-Za-z0-9._-] (path/query injection)', () => {
+    expect(() => bb.splitWorkspaceRepo('ws/repo?role=admin')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo('ws/repo%2f..')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo('ws /repo')).toThrow(ProviderError);
+    expect(() => bb.splitWorkspaceRepo('ws/re po')).toThrow(ProviderError);
+  });
+});
+
+describe('bitbucket - isBranchMergedInto (ancestor check)', () => {
+  const bb = getProvider('bitbucket');
+  const branchUrl = (b) => `/refs/branches/${b}`;
+
+  it('returns true when the two branch HEADs are identical', async () => {
+    const fetchImpl = makeFetch([
+      [branchUrl('task'), { json: { target: { hash: 'abc123' } } }],
+      [branchUrl('sprint'), { json: { target: { hash: 'abc123' } } }],
+    ]);
+    const merged = await bb.isBranchMergedInto({ token: 't', fetchImpl }, 'ws/repo', 'task', 'sprint');
+    expect(merged).toBe(true);
+  });
+
+  it('returns true when the task HEAD is an ancestor reachable in the sprint history', async () => {
+    const fetchImpl = makeFetch([
+      [branchUrl('task'), { json: { target: { hash: 'task-head' } } }],
+      [branchUrl('sprint'), { json: { target: { hash: 'sprint-head' } } }],
+      [
+        '/commits/sprint',
+        {
+          json: {
+            values: [{ hash: 'sprint-head' }, { hash: 'merge-commit' }, { hash: 'task-head' }],
+          },
+        },
+      ],
+    ]);
+    const merged = await bb.isBranchMergedInto({ token: 't', fetchImpl }, 'ws/repo', 'task', 'sprint');
+    expect(merged).toBe(true);
+  });
+
+  it('returns false when the task HEAD is not reachable from the sprint HEAD', async () => {
+    const fetchImpl = makeFetch([
+      [branchUrl('task'), { json: { target: { hash: 'task-head' } } }],
+      [branchUrl('sprint'), { json: { target: { hash: 'sprint-head' } } }],
+      [
+        '/commits/sprint',
+        { json: { values: [{ hash: 'sprint-head' }, { hash: 'other-commit' }] } },
+      ],
+    ]);
+    const merged = await bb.isBranchMergedInto({ token: 't', fetchImpl }, 'ws/repo', 'task', 'sprint');
+    expect(merged).toBe(false);
+  });
+
+  it('returns false when a branch ref cannot be resolved', async () => {
+    const fetchImpl = makeFetch([
+      [branchUrl('task'), { status: 404, json: {} }],
+      [branchUrl('sprint'), { json: { target: { hash: 'sprint-head' } } }],
+    ]);
+    const merged = await bb.isBranchMergedInto({ token: 't', fetchImpl }, 'ws/repo', 'task', 'sprint');
+    expect(merged).toBe(false);
   });
 });

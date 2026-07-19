@@ -19,12 +19,27 @@ const id = 'bitbucket';
 const displayName = 'Bitbucket';
 const gitHost = 'bitbucket.org';
 
+// Username used in the clone URL's basic-auth userinfo. The construction runtime
+// (pool-worker) builds a TOKENLESS `https://<cloneAuthUser>@host/repo.git` URL and
+// supplies the token out-of-band via GIT_ASKPASS, so the secret never lands in
+// .git/config, process argv, or git's URL-bearing error output.
+const cloneAuthUser = 'x-token-auth';
+
 // Repo reference for Bitbucket is "workspace/repo_slug" (similar to GitHub).
 // The clone URL embeds the token via the x-token-auth scheme.
 const buildCloneUrl = (repoId, token) => {
-  const auth = token ? `x-token-auth:${token}@` : '';
+  const auth = token ? `${cloneAuthUser}:${token}@` : '';
   return `https://${auth}${gitHost}/${repoId}.git`;
 };
+
+// Bitbucket workspace slugs and repo slugs are restricted by Atlassian to
+// ASCII letters, digits, and -_.  We enforce that here because both segments
+// are interpolated directly into Bitbucket API request URLs (some call sites
+// don't encodeURIComponent them); a strict allowlist prevents a crafted
+// reference like "repo?role=admin" or "ws%2f.." from tampering with the
+// request path/query. This is stricter than a bare split and matches the
+// shell-injection posture of shared/repo-validation.js.
+const WORKSPACE_REPO_SEGMENT = /^[A-Za-z0-9._-]+$/;
 
 const splitWorkspaceRepo = (repoId) => {
   if (!repoId || typeof repoId !== 'string') {
@@ -34,7 +49,14 @@ const splitWorkspaceRepo = (repoId) => {
   if (parts.length !== 2 || !parts[0] || !parts[1]) {
     throw new ProviderError(400, `Invalid gitRepo "${repoId}": expected "workspace/repo_slug"`);
   }
-  return { workspace: parts[0], repo_slug: parts[1] };
+  const [workspace, repo_slug] = parts;
+  if (!WORKSPACE_REPO_SEGMENT.test(workspace) || !WORKSPACE_REPO_SEGMENT.test(repo_slug)) {
+    throw new ProviderError(
+      400,
+      `Invalid gitRepo "${repoId}": workspace and repo_slug may only contain letters, digits, ".", "_" and "-"`,
+    );
+  }
+  return { workspace, repo_slug };
 };
 
 // ---------------------------------------------------------------------------
@@ -724,6 +746,7 @@ module.exports = {
   gitHost,
   apiBase: API_BASE,
   buildCloneUrl,
+  cloneAuthUser,
   splitWorkspaceRepo,
   apiHeaders,
   bbFetch,
@@ -736,6 +759,7 @@ module.exports = {
   listPRComments,
   addPRComment,
   getUnmergedConstructionTaskBranches,
+  isBranchMergedInto,
   cleanupConstructionTaskBranches,
   createPullRequest,
   getPullRequestState,

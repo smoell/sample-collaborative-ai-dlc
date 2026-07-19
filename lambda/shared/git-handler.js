@@ -96,9 +96,24 @@ export const createGitHandler = (provider, routes) => {
       code: _code,
       state: _state,
       accessToken: _accessToken,
+      queryStringParameters: _qs,
       ...safeEvent
     } = event;
-    console.log('Request:', JSON.stringify({ ...safeEvent, body: '[REDACTED]' }));
+    // The OAuth `code` and `state` arrive in queryStringParameters (not at the
+    // top level), so stripping top-level keys alone would still log the
+    // single-use authorization code + signed state to CloudWatch. Redact the
+    // sensitive query params explicitly while keeping the rest for debugging.
+    const safeQs = _qs
+      ? Object.fromEntries(
+          Object.entries(_qs).map(([k, v]) =>
+            ['code', 'state', 'token', 'access_token'].includes(k) ? [k, '[REDACTED]'] : [k, v],
+          ),
+        )
+      : _qs;
+    console.log(
+      'Request:',
+      JSON.stringify({ ...safeEvent, queryStringParameters: safeQs, body: '[REDACTED]' }),
+    );
 
     if (event.httpMethod === 'OPTIONS') return response(200, {});
 
