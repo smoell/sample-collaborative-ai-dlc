@@ -139,7 +139,10 @@ resource "null_resource" "yjs_build" {
     EOT
   }
 
-  depends_on = [aws_s3_object.yjs_src, aws_codebuild_project.yjs]
+  # Attach the CodeBuild service-role policy before the first build starts,
+  # otherwise the build fails in QUEUED with ACCESS_DENIED on logs:CreateLogStream
+  # (freshly-created policy not yet in effect). See the agents module for detail.
+  depends_on = [aws_s3_object.yjs_src, aws_codebuild_project.yjs, aws_iam_role_policy.yjs_codebuild]
 }
 
 locals {

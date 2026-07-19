@@ -169,5 +169,10 @@ resource "null_resource" "agents_build" {
     EOT
   }
 
-  depends_on = [aws_s3_object.agents_src, aws_codebuild_project.agents]
+  # The CodeBuild service role's inline policy (logs:CreateLogStream, ECR push,
+  # S3 source read) must be attached BEFORE the build starts — otherwise the
+  # very first build fails in the QUEUED phase with ACCESS_DENIED on
+  # logs:CreateLogStream (freshly-created policy not yet in effect). Depend on
+  # the policy explicitly so the first apply is ordered correctly.
+  depends_on = [aws_s3_object.agents_src, aws_codebuild_project.agents, aws_iam_role_policy.agents_codebuild]
 }
